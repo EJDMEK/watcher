@@ -5,16 +5,49 @@ const TelegramBot = require('node-telegram-bot-api');
 // --- CONFIGURATION ---
 const WSS_URL = process.env.ALCHEMY_WSS_URL;
 const CTF_EXCHANGE_ADDRESS = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E";
-const TARGET_WALLET = process.env.TARGET_WALLET;
 
-// Telegram Setup
+// Configuration for Targets
+const TARGET_WALLETS = (process.env.TARGET_WALLETS || process.env.TARGET_WALLET || "")
+    .split(",")
+    .map(a => a.trim().toLowerCase())
+    .filter(a => a);
+
+const BOT_NAME = process.env.BOT_NAME || "Polymarket Watcher";
+
+// --- TELEGRAM SETUP ---
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 let telegramBot = null;
+let lastBlockProcessed = 0;
 
 if (TELEGRAM_TOKEN && TELEGRAM_CHAT_ID) {
-    telegramBot = new TelegramBot(TELEGRAM_TOKEN, { polling: false });
-    console.log("📱 Telegram Bot Configured.");
+    // Enable polling to receive commands
+    telegramBot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
+    console.log("📱 Telegram Bot Configured & Listening for commands...");
+
+    // COMMAND: /status
+    telegramBot.onText(/\/status/, (msg) => {
+        if (msg.chat.id.toString() !== TELEGRAM_CHAT_ID) return;
+        const uptime = process.uptime();
+        const statusMsg = `🤖 <b>${BOT_NAME} Status</b>\n\n` +
+            `✅ Running: Yes\n` +
+            `⏱ Uptime: ${Math.floor(uptime / 60)} min\n` +
+            `📦 Last Block: ${lastBlockProcessed}\n` +
+            `🎯 Targets: ${TARGET_WALLETS.length}`;
+        telegramBot.sendMessage(TELEGRAM_CHAT_ID, statusMsg, { parse_mode: "HTML" });
+    });
+
+    // COMMAND: /ping
+    telegramBot.onText(/\/ping/, (msg) => {
+        if (msg.chat.id.toString() !== TELEGRAM_CHAT_ID) return;
+        telegramBot.sendMessage(TELEGRAM_CHAT_ID, `🏓 Pong! (${BOT_NAME})`);
+    });
+
+    // COMMAND: /targets
+    telegramBot.onText(/\/targets/, (msg) => {
+        if (msg.chat.id.toString() !== TELEGRAM_CHAT_ID) return;
+        telegramBot.sendMessage(TELEGRAM_CHAT_ID, `🎯 <b>Monitored Wallets:</b>\n\n${TARGET_WALLETS.join("\n")}`, { parse_mode: "HTML" });
+    });
 }
 
 async function sendTelegramAlert(message) {
@@ -26,116 +59,90 @@ async function sendTelegramAlert(message) {
     }
 }
 
-// Gnosis Safe Proxy often used by traders
-const GNOSIS_SAFE_ABI = [
-    "function execTransaction(address to, uint256 value, bytes data, uint8 operation, uint256 safeTxGas, uint256 baseGas, uint256 gasPrice, address gasToken, address refundReceiver, bytes signatures) payable returns (bool success)"
-];
-// Minimal ABI for CTF Exchange to decode orders
-const CTF_EXCHANGE_ABI = [
-    "function fillOrder(bytes order, uint256 fillAmount, uint256 price, uint256 feeAmount)",
-    "function batchBuy(uint256[] tokenIds, uint256[] amounts, uint256[] maxPrices)"
+// Minimal ABI for Events
+const LOG_ABI = [
+    "event OrderFilled(bytes32 indexed orderHash, address indexed maker, address indexed taker, uint256 makerAssetId, uint256 takerAssetId, uint256 makerAmount, uint256 takerAmount)",
+    "event OrdersMatched(bytes32 indexed orderHash, address indexed maker, address indexed taker, uint256 makerAssetId, uint256 takerAssetId, uint256 makerAmount, uint256 takerAmount)"
+    // Added OrdersMatched just in case, but usually it's OrderFilled
 ];
 
 async function main() {
-    console.log("🚀 Starting Polymarket Watcher (Block Mode)...");
+    console.log(`🚀 Starting ${BOT_NAME} (Event Log Mode)...`);
+    console.log(`🎯 Watching Targets:\n   - ${TARGET_WALLETS.join("\n   - ")}`);
 
-    // Notify startup
-    if (telegramBot) await sendTelegramAlert(`🚀 <b>Watcher Started!</b>\nTarget: <code>${TARGET_WALLET}</code>`);
+    if (telegramBot) await sendTelegramAlert(`🚀 <b>${BOT_NAME} Started!</b>\nMode: Event Logs (Relayer-Proof)\nWatching ${TARGET_WALLETS.length} wallets.`);
 
     const provider = new ethers.WebSocketProvider(WSS_URL);
+    const iface = new ethers.Interface(LOG_ABI);
 
     console.log(`📡 Connecting to: ${WSS_URL}`);
     console.log("✅ WebSocket Provider initialized.");
-    provider.on("error", (tx) => console.log("❌ Error:", tx));
-
-    const safeInterface = new ethers.Interface(GNOSIS_SAFE_ABI);
-    const exchangeInterface = new ethers.Interface(CTF_EXCHANGE_ABI);
-
-    console.log(`👀 Watching for new blocks...`);
 
     provider.on("block", async (blockNumber) => {
+        lastBlockProcessed = blockNumber;
+        if (blockNumber % 10 === 0) console.log(`📦 Block Mined: ${blockNumber}`);
+
         try {
-            // Keep-alive log every 10 blocks or so to keep console clean but alive
-            if (blockNumber % 10 === 0) console.log(`📦 Block Mined: ${blockNumber}`);
+            // EFFICIENT STRATEGY: Get Logs for this block for our Exchange Contract
+            // We retrieve ALL logs for the exchange in this block and filter in memory.
+            // Why? Because creating 10 different filters for 10 users is heavy.
+            // Fetching 5-10 logs per block is cheap.
 
-            // Get block with transactions
-            const block = await provider.getBlock(blockNumber, true);
+            const logs = await provider.getLogs({
+                fromBlock: blockNumber,
+                toBlock: blockNumber,
+                address: CTF_EXCHANGE_ADDRESS
+            });
 
-            if (!block || !block.prefetchedTransactions) return;
-            const txs = block.prefetchedTransactions;
-
-            for (const tx of txs) {
-                // --- FILTERING LOGIC ---
-                const targetLower = TARGET_WALLET ? TARGET_WALLET.toLowerCase() : null;
-
-                // 1. Is it our specific target?
-                const isTarget = targetLower && (
-                    (tx.from && tx.from.toLowerCase() === targetLower) ||
-                    (tx.to && tx.to.toLowerCase() === targetLower)
-                );
-
-                // 2. Is it interaction with the Exchange?
-                const isExchangeInteraction = tx.to && tx.to.toLowerCase() === CTF_EXCHANGE_ADDRESS.toLowerCase();
-
-                // STRICT FILTER: Only proceed if it involves our TARGET
-                if (!isTarget) continue;
-
-                const alertTitle = `\n🎯 TARGET DETECTED in Block ${blockNumber}: ${tx.hash}`;
-                console.log(alertTitle);
-
-                let messageDetails = "";
-                let actionType = "Unknown Interaction";
-
-                // --- DECODING LOGIC ---
-
-                // Decode Exchange calls (Direct)
-                if (isExchangeInteraction) {
-                    try {
-                        const decoded = exchangeInterface.parseTransaction({ data: tx.data });
-
-                        if (decoded) {
-                            console.log(`   Function: ${decoded.name}`);
-                            messageDetails += `Function: <b>${decoded.name}</b>\n`;
-
-                            if (decoded.name === 'fillOrder') {
-                                actionType = "💰 Buy/Sell Order";
-                                messageDetails += `Log: Direct CLOB interaction.\n`;
-                            }
-                        }
-                    } catch (e) { }
-                }
-
-                // Decode Gnosis Safe (Proxy)
-                // This is where most "Smart Money" hides
-                if (isTarget) {
-                    try {
-                        const decodedSafe = safeInterface.parseTransaction({ data: tx.data });
-                        if (decodedSafe && decodedSafe.name === "execTransaction") {
-                            const internalData = decodedSafe.args[2];
-                            try {
-                                const decodedInternal = exchangeInterface.parseTransaction({ data: internalData });
-                                console.log(`      🕵️‍♀️ Proxy Execution: ${decodedInternal.name}`);
-                                actionType = "🕵️‍♀️ Gnosis Proxy Trade";
-                                messageDetails += `Function: <b>${decodedInternal.name}</b>\n`;
-                            } catch (e) { }
-                        }
-                    } catch (e) { }
-                }
-
-                // Send Alert
-                const msg = `🚨 <b>ACTIVITY DETECTED</b> 🚨\n\n` +
-                    `Action: ${actionType}\n` +
-                    `Target: <code>${TARGET_WALLET.slice(0, 6)}...${TARGET_WALLET.slice(-4)}</code>\n` +
-                    `Block: ${blockNumber}\n\n` +
-                    `${messageDetails}\n` +
-                    `🔗 <a href="https://polygonscan.com/tx/${tx.hash}">Check on PolygonScan</a>`;
-
-                await sendTelegramAlert(msg);
+            if (logs.length > 0) {
+                // console.log(`   (Scanning ${logs.length} logs from Exchange...)`);
             }
+
+            for (const log of logs) {
+                let parsedLog;
+                try {
+                    parsedLog = iface.parseLog(log);
+                } catch (e) {
+                    continue; // Log event not in our ABI (unknown event)
+                }
+
+                if (!parsedLog) continue;
+
+                // Check if Maker OR Taker matches any of our targets
+                const maker = parsedLog.args.maker.toLowerCase();
+                const taker = parsedLog.args.taker.toLowerCase();
+
+                const matchedTarget = TARGET_WALLETS.find(t => t === maker || t === taker);
+
+                if (matchedTarget) {
+                    console.log(`\n🚨 FOUND TRADE via EVENT! Block ${blockNumber}`);
+                    console.log(`   Event: ${parsedLog.name}`);
+                    console.log(`   Maker: ${maker} ${maker === matchedTarget ? "(TARGET)" : ""}`);
+                    console.log(`   Taker: ${taker} ${taker === matchedTarget ? "(TARGET)" : ""}`);
+
+                    const isBuy = maker === matchedTarget ? "Maker (Limit/Ask?)" : "Taker (Market/Buy?)";
+                    // Note: In Polymarket:
+                    // Maker = placed limit order
+                    // Taker = took the order (active trader)
+
+                    const msg = `🚨 <b>TRADE DETECTED (Event)</b> 🚨\n` +
+                        `Source: <b>${BOT_NAME}</b>\n\n` +
+                        `Action: <b>Order Filled</b>\n` +
+                        `Role: ${maker === matchedTarget ? "Maker (Passive)" : "Taker (Active)"}\n` +
+                        `Wallet: <code>${matchedTarget.slice(0, 6)}...${matchedTarget.slice(-4)}</code>\n` +
+                        `Block: ${blockNumber}\n` +
+                        `Tx: <a href="https://polygonscan.com/tx/${log.transactionHash}">View on PolygonScan</a>`;
+
+                    await sendTelegramAlert(msg);
+                }
+            }
+
         } catch (err) {
-            console.error("Error processing block:", err.message);
+            console.error("❌ Error fetching logs:", err.message);
         }
     });
+
+    provider.on("error", (tx) => console.log("❌ Error:", tx));
 }
 
 main().catch(console.error);
